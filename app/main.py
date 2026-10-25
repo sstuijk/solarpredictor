@@ -467,7 +467,24 @@ def train(request: TrainRequest) -> dict[str, Any]:
         )
     weather = _add_time_features(_fetch_historical_weather(production["timestamp"].min(), production["timestamp"].max()))
     merged = production.merge(weather, on="timestamp", how="inner")
-    merged = merged.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURES + ["target"])
+    merged = merged.replace([np.inf, -np.inf], np.nan)
+    merged = merged.dropna(subset=FEATURES + ["target"])
+    
+    # Exclude nighttime production readings from model training.
+    # Open-Meteo shortwave radiation is measured in W/m².
+    NIGHT_RADIATION_THRESHOLD = 5.0
+    merged = merged[
+        merged["shortwave_radiation"] > NIGHT_RADIATION_THRESHOLD
+    ].copy()
+    
+    if len(merged) < max(48, request.min_rows // 2):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Not enough daylight production rows remain for training. "
+                "Check the historical weather data and requested training period."
+            ),
+        )
     if len(merged) < max(48, request.min_rows // 2):
         raise HTTPException(
             status_code=400,
@@ -526,7 +543,15 @@ def predict_forecast(request: ForecastRequest) -> dict[str, Any]:
             status_code=502,
             detail=f"Open-Meteo returned {len(selected)} hours for a {request.hours}-hour request. The selected range may extend beyond its forecast window.",
         )
-    selected["predicted_energy_kwh"] = np.maximum(0, bundle["model"].predict(selected[FEATURES]))
+    selected["predicted_energy_kwh"] = np.maximum(
+        0, bundle["model"].predict(selected[FEATURES])
+    )
+    
+    # Force production to zero when solar radiation is negligible.
+    selected.loc[
+        selected["shortwave_radiation"] <= 5.0,
+        "predicted_energy_kwh",
+    ] = 0.0
     # Energy must be non-negative and a single hourly interval cannot exceed panel kWp
     # by a physically meaningful margin. This cap is a guardrail, not a PV model.
     selected["predicted_energy_kwh"] = selected["predicted_energy_kwh"].clip(lower=0, upper=PANEL_CAPACITY_KWP)
