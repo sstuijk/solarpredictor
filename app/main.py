@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from io import BytesIO
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -12,8 +13,12 @@ from websockets.sync.client import connect
 import joblib
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
@@ -35,6 +40,8 @@ LATITUDE = float(os.getenv("LATITUDE", "50.95"))
 LONGITUDE = float(os.getenv("LONGITUDE", "5.87"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Amsterdam")
 PANEL_CAPACITY_KWP = float(os.getenv("PANEL_CAPACITY_KWP", "9.8"))
+PANEL_TILT = float(os.getenv("PANEL_TILT", "30"))
+PANEL_AZIMUTH = float(os.getenv("PANEL_AZIMUTH", "0"))
 HA_URL = os.getenv("HA_URL", "").rstrip("/")
 HA_TOKEN = os.getenv("HA_TOKEN", "")
 HA_ENTITY_ID = os.getenv("HA_ENTITY_ID", "")
@@ -43,13 +50,15 @@ HA_ENERGY_UNIT = os.getenv("HA_ENERGY_UNIT", "kWh").strip()
 # interval_energy uses the REST history endpoint for per-interval readings.
 HA_FEED_MODE = os.getenv("HA_FEED_MODE", "cumulative_energy").strip().lower()
 MAX_FORECAST_DAYS = int(os.getenv("MAX_FORECAST_DAYS", "7"))
+OPEN_METEO_MODEL="best_match"
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 HOURLY_WEATHER = [
-    "temperature_2m", "relative_humidity_2m", "cloud_cover",
+    "temperature_2m", "relative_humidity_2m", "cloud_cover_low", "cloud_cover_mid",
+    "cloud_cover_high", "rain", "snow_depth",
     "shortwave_radiation", "direct_radiation", "diffuse_radiation",
-    "wind_speed_10m", "precipitation", "is_day",
+    "wind_speed_10m", "precipitation", "is_day", "global_tilted_irradiance",
 ]
 WEATHER_FEATURES = HOURLY_WEATHER
 TIME_FEATURES = [
@@ -101,6 +110,9 @@ def _weather_params() -> dict[str, Any]:
         "longitude": LONGITUDE,
         "hourly": ",".join(HOURLY_WEATHER),
         "timezone": "UTC",
+        "tilt": PANEL_TILT,
+        "azimuth": PANEL_AZIMUTH,
+        "models": OPEN_METEO_MODEL,
     }
 
 
@@ -493,12 +505,12 @@ def train(request: TrainRequest) -> dict[str, Any]:
         )
 
     merged = merged.sort_values("timestamp").reset_index(drop=True)
-    split = int(len(merged) * 0.8)
+    split = int(len(merged) * 0.75)
     train_df, test_df = merged.iloc[:split], merged.iloc[split:]
     model = lgb.LGBMRegressor(
-        objective="regression", n_estimators=1200, learning_rate=0.03,
-        num_leaves=31, max_depth=-1, min_child_samples=30, subsample=0.85,
-        subsample_freq=1,
+        objective="regression", n_estimators=3600, learning_rate=0.03,
+        num_leaves=63, max_depth=-1, min_child_samples=60, subsample=0.85,
+        subsample_freq=1, boosting="dart",
         colsample_bytree=0.9, reg_lambda=1.0, random_state=42, verbosity=-1,
     )
     model.fit(
@@ -514,6 +526,7 @@ def train(request: TrainRequest) -> dict[str, Any]:
         "validation_rows": int(len(test_df)),
         "mae_kwh_per_hour": float(mean_absolute_error(actual, pred)),
         "rmse_kwh_per_hour": float(np.sqrt(mean_squared_error(actual, pred))),
+        "median_absolute_percentage_error_per_hour": float(np.median(np.abs((actual - pred)/(actual+1)))*100),
         "best_iteration": int(getattr(model, "best_iteration_", 0) or model.n_estimators),
         "validation_period_start": str(test_df["timestamp"].min()),
         "validation_period_end": str(test_df["timestamp"].max()),
@@ -564,9 +577,6 @@ def predict_forecast(request: ForecastRequest) -> dict[str, Any]:
         records.append({
             "timestamp": pd.Timestamp(row.timestamp).isoformat(),
             "predicted_energy_kwh": float(row.predicted_energy_kwh),
-            "shortwave_radiation_w_m2": None if pd.isna(row.shortwave_radiation) else float(row.shortwave_radiation),
-            "temperature_c": None if pd.isna(row.temperature_2m) else float(row.temperature_2m),
-            "cloud_cover_pct": None if pd.isna(row.cloud_cover) else float(row.cloud_cover),
         })
     local_dates = selected["timestamp"].dt.tz_convert(TIMEZONE).dt.date.astype(str)
     daily = selected.assign(local_date=local_dates).groupby("local_date")["predicted_energy_kwh"].sum().round(3).to_dict()
@@ -582,6 +592,59 @@ def predict_forecast(request: ForecastRequest) -> dict[str, Any]:
         "model_metrics": bundle.get("metrics", {}),
         "forecast": records,
     }
+
+
+@app.get("/predict/forecast.png", response_class=StreamingResponse)
+def predict_forecast_png(
+    start: datetime | None = None,
+    hours: int = 168,
+) -> StreamingResponse:
+    """Generate an inline PNG chart for the requested forecast."""
+    request = ForecastRequest(start=start, hours=hours)
+    forecast_data = predict_forecast(request)
+    forecast = pd.DataFrame(forecast_data["forecast"])
+    if forecast.empty:
+        raise HTTPException(status_code=502, detail="The forecast contains no data to plot.")
+
+    forecast["timestamp"] = pd.to_datetime(forecast["timestamp"], utc=True).dt.tz_convert(TIMEZONE)
+    forecast["local_date"] = forecast["timestamp"].dt.strftime("%Y-%m-%d")
+    daily = forecast.groupby("local_date", sort=True)["predicted_energy_kwh"].sum()
+
+    # A two-panel chart keeps hourly detail readable while showing daily totals.
+    fig, (ax_hourly, ax_daily) = plt.subplots(
+        2, 1, figsize=(12, 7.5), gridspec_kw={"height_ratios": [2.4, 1]},
+        constrained_layout=True,
+    )
+
+    times = forecast["timestamp"]
+    values = forecast["predicted_energy_kwh"]
+    ax_hourly.bar(times, values, width=0.035, align="center", color="#8b5cf6")
+    ax_hourly.set_ylabel("Energy per hour (kWh)")
+    ax_hourly.set_xlim(times.min() - pd.Timedelta(minutes=35),
+                       times.max() + pd.Timedelta(minutes=35))
+    ax_hourly.xaxis.set_major_formatter(mdates.DateFormatter("%a %d %b"))
+    ax_hourly.grid(axis="y", alpha=0.25)
+    ax_hourly.set_axisbelow(True)
+
+    daily_dates = pd.to_datetime(daily.index)
+    bars = ax_daily.bar(daily_dates, daily.values, color="#ec78b7", width=0.65)
+    ax_daily.xaxis.set_major_formatter(mdates.DateFormatter("%a %d %b"))
+    ax_daily.set_ylabel("Daily total (kWh)")
+    ax_daily.grid(axis="y", alpha=0.25)
+    ax_daily.set_axisbelow(True)
+    ax_daily.bar_label(bars, fmt="%.1f", padding=3, fontsize=8)
+    ax_daily.margins(y=0.18)
+
+    image_buffer = BytesIO()
+    fig.savefig(image_buffer, format="png", dpi=160, facecolor="white")
+    plt.close(fig)
+    image_buffer.seek(0)
+    filename = f"solar-forecast-{forecast_data['forecast_start'][:10]}.png"
+    return StreamingResponse(
+        image_buffer,
+        media_type="image/png",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
 
 
 @app.get("/metrics")
