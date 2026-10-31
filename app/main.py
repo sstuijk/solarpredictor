@@ -13,6 +13,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
@@ -433,9 +434,9 @@ def _load_model() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Could not load trained model: {exc}") from exc
 
 
-@app.get("/")
-def root() -> dict[str, str]:
-    return {"name": "Solar Production Forecast API", "docs": "/docs", "health": "/health"}
+@app.get("/",  include_in_schema=False)
+def api_docs():
+    return RedirectResponse("/docs")
 
 
 @app.get("/health")
@@ -491,11 +492,13 @@ def train(request: TrainRequest) -> dict[str, Any]:
             detail=f"Only {len(merged)} production rows matched hourly weather. Check timezone, recorder history, and sensor update semantics.",
         )
 
+    merged = merged.sort_values("timestamp").reset_index(drop=True)
     split = int(len(merged) * 0.8)
     train_df, test_df = merged.iloc[:split], merged.iloc[split:]
     model = lgb.LGBMRegressor(
-        objective="regression", n_estimators=900, learning_rate=0.03,
-        num_leaves=31, max_depth=-1, subsample=0.85,
+        objective="regression", n_estimators=1200, learning_rate=0.03,
+        num_leaves=31, max_depth=-1, min_child_samples=30, subsample=0.85,
+        subsample_freq=1,
         colsample_bytree=0.9, reg_lambda=1.0, random_state=42, verbosity=-1,
     )
     model.fit(
